@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 BLE Hand Controller</title>
+<style>
+  :root{color-scheme:dark}
+  body{margin:0;background:#0b0f14;color:#cfe8ff;font:14px system-ui,sans-serif;display:flex;justify-content:center;padding:16px}
+  #wrap{width:min(100%,680px)}
+  h1{font-size:18px;margin:0 0 12px;color:#7fd0ff}
+  #stage{position:relative;width:100%;aspect-ratio:4/3;background:#000;border:1px solid #1f3347;border-radius:10px;overflow:hidden}
+  #stage video,#stage canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+  #panel{margin-top:12px;display:grid;gap:10px}
+  .row{display:flex;flex-wrap:wrap;gap:12px;align-items:center}
+  input[type=text]{background:#101a26;border:1px solid #28435c;color:#e6f3ff;padding:6px 8px;border-radius:6px;width:160px}
+  button{background:#1b6fb3;border:0;color:#fff;padding:8px 16px;border-radius:6px;font-weight:600;cursor:pointer}
+  button:disabled{opacity:.5;cursor:default}
+  #stat{font-family:ui-monospace,monospace;font-size:13px;color:#9fd6ff;white-space:pre-line}
+  small{color:#6f8aa3}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <h1>ESP32 Hand Controller · BLE</h1>
+  <div id="stage"><video id="v" playsinline muted></video><canvas id="o"></canvas></div>
+  <div id="panel">
+    <div class="row">
+      <button id="ble">Connect ESP32 via Bluetooth</button>
+      <button id="go" disabled>Start camera + tracking</button>
+    </div>
+    <div class="row">
+      <label><input type="checkbox" id="fx" checked> mirror X</label>
+      <label><input type="checkbox" id="fy" checked> flip Y</label>
+      <label><input type="checkbox" id="fz" checked> flip Z</label>
+      <small>(if the OLED hand looks mirrored / upside-down / inside-out, toggle these)</small>
+    </div>
+    <div id="stat">idle</div>
+    <small>Use current Chrome or Edge with Web Bluetooth support. Connect to <b>ESP32-Hand-Mirror</b> first, then start the camera. Run this page from a secure context (HTTPS or localhost; file:// may work depending on browser). The hand-tracking model is downloaded from the internet.</small>
+  </div>
+</div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// BLE service UUIDs below must match the ESP32 firmware.
+
+const WASM_URL  = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+               [9,13],[13,14],[14,15],[15,16],[13,17],[0,17],[17,18],[18,19],[19,20]];
+
+const $ = id => document.getElementById(id);
+const video = $("v"), overlay = $("o"), octx = overlay.getContext("2d");
+const goBtn = $("go"), bleBtn = $("ble"), statEl = $("stat");
+
+// BLE UART-style service shared with the ESP32 firmware.
+const BLE_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const BLE_RX_UUID      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+const BLE_PACKET_MAGIC = 0xD7;
+const BLE_CHUNK_BYTES  = 16;
+const BLE_CHUNK_COUNT  = 8;
+let bleDevice = null, bleServer = null, bleRx = null, bleOk = false;
+let bleSeq = 0, pendingBleJob = null, bleSenderBusy = false, droppedBleJobs = 0;
+
+function updateBleStatus(message) {
+  statEl.textContent = `Bluetooth ${bleOk ? "CONNECTED" : "disconnected"}\n${message || ""}`;
+}
+function bluetoothEnvironmentHint() {
+  const secure = window.isSecureContext;
+  const topLevel = window.top === window.self;
+  if (!secure) {
+    return `This page is not a secure context (isSecureContext=false). Current URL: ${location.href}. Open it over HTTPS or localhost.`;
+  }
+  if (!topLevel) {
+    return `This page is embedded in a frame (topLevel=false). Open the controller URL directly in a new browser tab.`;
+  }
+  return `This page is secure and top-level, but navigator.bluetooth is unavailable. Use desktop Chrome or Edge with Web Bluetooth enabled. Details: isSecureContext=${secure}, topLevel=${topLevel}, URL=${location.href}`;
+}
+
+async function connectBLE() {
+  if (!navigator.bluetooth) {
+    throw new Error(bluetoothEnvironmentHint());
+  }
+  bleBtn.disabled = true;
+  bleBtn.textContent = "Choose ESP32...";
+  try {
+    bleDevice = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [BLE_SERVICE_UUID] }],
+      optionalServices: [BLE_SERVICE_UUID]
+    });
+    bleDevice.addEventListener("gattserverdisconnected", () => {
+      bleOk = false; bleRx = null; bleServer = null; pendingBleJob = null;
+      goBtn.disabled = true;
+      bleBtn.disabled = false; bleBtn.textContent = "Reconnect ESP32 via Bluetooth";
+      updateBleStatus("Device disconnected. Reconnect to continue.");
+    });
+    bleServer = await bleDevice.gatt.connect();
+    const service = await bleServer.getPrimaryService(BLE_SERVICE_UUID);
+    bleRx = await service.getCharacteristic(BLE_RX_UUID);
+    bleOk = true;
+    bleBtn.textContent = "Bluetooth connected";
+    goBtn.disabled = false;
+    updateBleStatus("Connected to " + (bleDevice.name || "ESP32-Hand-Mirror"));
+  } catch (err) {
+    bleOk = false; bleRx = null;
+    bleBtn.disabled = false; bleBtn.textContent = "Connect ESP32 via Bluetooth";
+    updateBleStatus("Bluetooth error: " + (err && err.message ? err.message : err));
+    throw err;
+  }
+}
+bleBtn.addEventListener("click", async () => {
+  try { await connectBLE(); }
+  catch (err) { console.error(err); }
+});
+
+// Frame format: [0xA5][flags: bit0 = hand present][21 landmarks * (x,y,z) int16 LE]  => 128 bytes
+// Units: 1.0 = 16384 counts = 12 cm (MediaPipe world landmarks, metres, origin ~ palm centre)
+const SCALE = 16384 / 0.12;
+const clamp16 = v => Math.max(-32768, Math.min(32767, Math.round(v)));
+let lastEmptySent = 0, sentCount = 0;
+
+async function writeBlePacket(packet) {
+  if (!bleOk || !bleRx) throw new Error("Bluetooth is disconnected");
+  if (bleRx.writeValueWithoutResponse) await bleRx.writeValueWithoutResponse(packet);
+  else await bleRx.writeValue(packet);
+}
+
+function queueBleJob(job) {
+  if (!bleOk || !bleRx) return;
+  if (pendingBleJob) droppedBleJobs++;
+  pendingBleJob = job; // retain newest pending frame rather than building latency
+  void drainBleQueue();
+}
+
+async function drainBleQueue() {
+  if (bleSenderBusy) return;
+  bleSenderBusy = true;
+  try {
+    while (pendingBleJob && bleOk && bleRx) {
+      const job = pendingBleJob;
+      pendingBleJob = null;
+      const seq = (bleSeq++ & 0xFF);
+      if (job.noHand) {
+        await writeBlePacket(new Uint8Array([BLE_PACKET_MAGIC, seq, 0xFE, 0x00]));
+      } else {
+        // 128-byte frame -> eight 20-byte GATT writes; works with default ATT MTU 23.
+        for (let i = 0; i < BLE_CHUNK_COUNT; i++) {
+          const packet = new Uint8Array(4 + BLE_CHUNK_BYTES);
+          packet[0] = BLE_PACKET_MAGIC;
+          packet[1] = seq;
+          packet[2] = i;
+          packet[3] = BLE_CHUNK_COUNT;
+          packet.set(job.bytes.subarray(i * BLE_CHUNK_BYTES, (i + 1) * BLE_CHUNK_BYTES), 4);
+          await writeBlePacket(packet);
+        }
+      }
+      sentCount++;
+    }
+  } catch (err) {
+    console.warn("BLE frame write failed", err);
+    bleOk = false; bleRx = null; pendingBleJob = null;
+    goBtn.disabled = true; bleBtn.disabled = false;
+    bleBtn.textContent = "Reconnect ESP32 via Bluetooth";
+    updateBleStatus("Write failed; reconnect Bluetooth.");
+  } finally {
+    bleSenderBusy = false;
+    if (pendingBleJob && bleOk) void drainBleQueue();
+  }
+}
+
+function sendHand(world) {
+  if (!bleOk || !bleRx) return;
+  if (!world) {
+    const now = performance.now();
+    if (now - lastEmptySent < 100) return; // no-hand keep-alive at 10 Hz
+    lastEmptySent = now;
+    queueBleJob({ noHand: true });
+    return;
+  }
+  const bytes = new Uint8Array(128), dv = new DataView(bytes.buffer);
+  dv.setUint8(0, 0xA5); dv.setUint8(1, 1);
+  const sx = $("fx").checked ? -1 : 1, sy = $("fy").checked ? -1 : 1, sz = $("fz").checked ? -1 : 1;
+  for (let i = 0; i < 21; i++) {
+    const p = world[i], o = 2 + i * 6;
+    dv.setInt16(o,     clamp16(p.x * sx * SCALE), true);
+    dv.setInt16(o + 2, clamp16(p.y * sy * SCALE), true);
+    dv.setInt16(o + 4, clamp16(p.z * sz * SCALE), true);
+  }
+  queueBleJob({ bytes, noHand: false });
+}
+
+// ---------- overlay ----------
+function drawOverlay(lm) {
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+  if (!lm) return;
+  const W = overlay.width, H = overlay.height;
+  octx.lineWidth = 3; octx.strokeStyle = "#39a7ff"; octx.beginPath();
+  for (const [a, b] of BONES) { octx.moveTo(lm[a].x * W, lm[a].y * H); octx.lineTo(lm[b].x * W, lm[b].y * H); }
+  octx.stroke();
+  octx.fillStyle = "#fff";
+  for (const p of lm) { octx.beginPath(); octx.arc(p.x * W, p.y * H, 4, 0, 6.2832); octx.fill(); }
+}
+
+// ---------- tracking ----------
+let landmarker = null, started = false, detCount = 0, lastStat = performance.now();
+
+async function createLandmarker() {
+  const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
+  const make = delegate => HandLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: MODEL_URL, delegate },
+    runningMode: "VIDEO",
+    numHands: 1,
+    minHandDetectionConfidence: 0.5,
+    minHandPresenceConfidence: 0.5,
+    minTrackingConfidence: 0.5
+  });
+  try { return await make("GPU"); }
+  catch (e) { console.warn("GPU delegate failed, falling back to CPU", e); return await make("CPU"); }
+}
+
+function tick() {
+  if (video.readyState >= 2) {
+    const res = landmarker.detectForVideo(video, performance.now());
+    detCount++;
+    const world = res.worldLandmarks && res.worldLandmarks[0];
+    const img   = res.landmarks && res.landmarks[0];
+    drawOverlay(img || null);
+    sendHand(world || null);
+  }
+  const now = performance.now();
+  if (now - lastStat >= 1000) {
+    const dt = (now - lastStat) / 1000;
+    statEl.textContent =
+      `tracking: ${(detCount / dt).toFixed(0)} fps   BLE frames: ${(sentCount / dt).toFixed(0)} fps\n` +
+      `Bluetooth ${bleOk ? "CONNECTED" : "disconnected"}   dropped stale jobs: ${droppedBleJobs}`;
+    detCount = 0; sentCount = 0; lastStat = now;
+  }
+  if ("requestVideoFrameCallback" in video) video.requestVideoFrameCallback(tick);
+  else requestAnimationFrame(tick);
+}
+
+goBtn.addEventListener("click", async () => {
+  if (started) return;
+  if (!bleOk || !bleRx) {
+    statEl.textContent = "Connect ESP32 via Bluetooth first.";
+    return;
+  }
+  goBtn.disabled = true;
+  try {
+    statEl.textContent = "Bluetooth connected; loading hand-tracking model...";
+    landmarker = await createLandmarker();
+    statEl.textContent = "starting camera...";
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 60 }, facingMode: "user" },
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    overlay.width = video.videoWidth || 640;
+    overlay.height = video.videoHeight || 480;
+    started = true;
+    tick();
+  } catch (err) {
+    console.error(err);
+    statEl.textContent = "error: " + (err && err.message ? err.message : err);
+    goBtn.disabled = !bleOk;
+  }
+});
+</script>
+</body>
+</html>
